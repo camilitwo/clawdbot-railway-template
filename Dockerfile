@@ -18,7 +18,7 @@ RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 ARG OPENCLAW_GIT_REF=v2026.9.6
 RUN set -eux; \
   version="${OPENCLAW_GIT_REF#v}"; \
-  npm install -g "openclaw@${version}"; \
+  npm install -g --allow-scripts=@google/genai,koffi,protobufjs,openclaw "openclaw@${version}"; \
   ln -s /usr/local/lib/node_modules/openclaw /openclaw
 
 # Persist user-installed tools by default by targeting the Railway volume.
