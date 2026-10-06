@@ -211,19 +211,19 @@ async function syncGatewayConfigBestEffort() {
 async function applyRuntimeConfigBestEffort() {
   if (runtimeConfigApplied || !isConfigured()) return;
   runtimeConfigApplied = true;
+  const quickConfig = { timeoutMs: 15_000 };
 
   try {
     if (PRIMARY_MODEL) {
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agents.defaults.model.primary", PRIMARY_MODEL]));
-      await runCmd(OPENCLAW_NODE, clawArgs(["models", "set", PRIMARY_MODEL]));
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agents.defaults.model.primary", PRIMARY_MODEL]), quickConfig);
       console.log(`[wrapper] primary model configured: ${PRIMARY_MODEL}`);
     }
 
     const telegramToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
     if (telegramToken) {
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.enabled", "true"]));
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.botToken", telegramToken]));
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.dmPolicy", "pairing"]));
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.enabled", "true"]), quickConfig);
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.botToken", telegramToken]), quickConfig);
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.dmPolicy", "pairing"]), quickConfig);
       console.log("[wrapper] telegram channel configured from TELEGRAM_BOT_TOKEN");
     } else {
       console.warn("[wrapper] TELEGRAM_BOT_TOKEN is not set; telegram channel was not configured");
