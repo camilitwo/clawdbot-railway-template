@@ -195,15 +195,42 @@ function serviceWindowStatus(date = new Date()) {
   };
 }
 
+function setNestedConfigValue(target, keyPath, value) {
+  const parts = keyPath.split(".");
+  let cursor = target;
+  for (const part of parts.slice(0, -1)) {
+    if (!cursor[part] || typeof cursor[part] !== "object" || Array.isArray(cursor[part])) {
+      cursor[part] = {};
+    }
+    cursor = cursor[part];
+  }
+  cursor[parts.at(-1)] = value;
+}
+
+function updateConfigFileBestEffort(updates) {
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  let config = {};
+  if (fs.existsSync(p)) {
+    const raw = fs.readFileSync(p, "utf8").trim();
+    config = raw ? JSON.parse(raw) : {};
+  }
+  for (const [key, value] of Object.entries(updates)) {
+    setNestedConfigValue(config, key, value);
+  }
+  fs.writeFileSync(p, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
 async function syncGatewayConfigBestEffort() {
   if (gatewayConfigSynced || !isConfigured() || !OPENCLAW_GATEWAY_TOKEN) return;
   gatewayConfigSynced = true;
-  const quickConfig = { timeoutMs: 15_000 };
   console.log("[wrapper] syncing gateway tokens in config...");
   try {
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]), quickConfig);
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]), quickConfig);
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]), quickConfig);
+    updateConfigFileBestEffort({
+      "gateway.auth.mode": "token",
+      "gateway.auth.token": OPENCLAW_GATEWAY_TOKEN,
+      "gateway.remote.token": OPENCLAW_GATEWAY_TOKEN,
+    });
     console.log("[wrapper] gateway tokens synced");
   } catch (err) {
     gatewayConfigSynced = false;
@@ -214,19 +241,27 @@ async function syncGatewayConfigBestEffort() {
 async function applyRuntimeConfigBestEffort() {
   if (runtimeConfigApplied || !isConfigured()) return;
   runtimeConfigApplied = true;
-  const quickConfig = { timeoutMs: 15_000 };
 
   try {
+    const updates = {};
     if (PRIMARY_MODEL) {
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agents.defaults.model.primary", PRIMARY_MODEL]), quickConfig);
-      console.log(`[wrapper] primary model configured: ${PRIMARY_MODEL}`);
+      updates["agents.defaults.model.primary"] = PRIMARY_MODEL;
     }
 
     const telegramToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
     if (telegramToken) {
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.enabled", "true"]), quickConfig);
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.botToken", telegramToken]), quickConfig);
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.dmPolicy", "pairing"]), quickConfig);
+      updates["channels.telegram.enabled"] = true;
+      updates["channels.telegram.botToken"] = telegramToken;
+      updates["channels.telegram.dmPolicy"] = "pairing";
+    }
+
+    if (Object.keys(updates).length > 0) {
+      updateConfigFileBestEffort(updates);
+    }
+    if (PRIMARY_MODEL) {
+      console.log(`[wrapper] primary model configured: ${PRIMARY_MODEL}`);
+    }
+    if (telegramToken) {
       console.log("[wrapper] telegram channel configured from TELEGRAM_BOT_TOKEN");
     } else {
       console.warn("[wrapper] TELEGRAM_BOT_TOKEN is not set; telegram channel was not configured");
