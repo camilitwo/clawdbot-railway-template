@@ -78,6 +78,10 @@ const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}
 // Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
 const OPENCLAW_ENTRY = process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
+const SERVICE_TIME_ZONE = process.env.CLAWDBOT_TIME_ZONE?.trim() || "America/Santiago";
+const SERVICE_START_TIME = process.env.CLAWDBOT_START_TIME?.trim() || "06:30";
+const SERVICE_STOP_TIME = process.env.CLAWDBOT_STOP_TIME?.trim() || "00:00";
+const AUTO_START_GATEWAY = process.env.CLAWDBOT_AUTOSTART_GATEWAY === "true";
 
 function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
@@ -142,9 +146,64 @@ let lastGatewayError = null;
 let lastGatewayExit = null;
 let lastDoctorOutput = null;
 let lastDoctorAt = null;
+let gatewayConfigSynced = false;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function parseClockMinutes(value, fallback) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(value || "");
+  if (!m) return fallback;
+  const hours = Number.parseInt(m[1], 10);
+  const minutes = Number.parseInt(m[2], 10);
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return fallback;
+  return hours * 60 + minutes;
+}
+
+function localClockMinutes(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: SERVICE_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const hour = Number.parseInt(parts.find((p) => p.type === "hour")?.value || "0", 10);
+  const minute = Number.parseInt(parts.find((p) => p.type === "minute")?.value || "0", 10);
+  return hour * 60 + minute;
+}
+
+function isWithinServiceWindow(date = new Date()) {
+  const start = parseClockMinutes(SERVICE_START_TIME, 390);
+  const stop = parseClockMinutes(SERVICE_STOP_TIME, 0);
+  const now = localClockMinutes(date);
+  if (start === stop) return true;
+  if (start < stop) return now >= start && now < stop;
+  return now >= start || now < stop;
+}
+
+function serviceWindowStatus(date = new Date()) {
+  return {
+    timeZone: SERVICE_TIME_ZONE,
+    start: SERVICE_START_TIME,
+    stop: SERVICE_STOP_TIME,
+    open: isWithinServiceWindow(date),
+  };
+}
+
+async function syncGatewayConfigBestEffort() {
+  if (gatewayConfigSynced || !isConfigured() || !OPENCLAW_GATEWAY_TOKEN) return;
+  gatewayConfigSynced = true;
+  console.log("[wrapper] syncing gateway tokens in config...");
+  try {
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+    console.log("[wrapper] gateway tokens synced");
+  } catch (err) {
+    gatewayConfigSynced = false;
+    console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
+  }
 }
 
 async function waitForGatewayReady(opts = {}) {
@@ -174,9 +233,13 @@ async function waitForGatewayReady(opts = {}) {
 async function startGateway() {
   if (gatewayProc) return;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
+  if (!isWithinServiceWindow()) {
+    throw new Error(`Gateway disabled outside service window ${SERVICE_START_TIME}-${SERVICE_STOP_TIME} ${SERVICE_TIME_ZONE}`);
+  }
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+  await syncGatewayConfigBestEffort();
 
   const args = [
     "gateway",
@@ -343,6 +406,7 @@ app.get("/healthz", async (_req, res) => {
       configured: isConfigured(),
       stateDir: STATE_DIR,
       workspaceDir: WORKSPACE_DIR,
+      serviceWindow: serviceWindowStatus(),
     },
     gateway: {
       target: GATEWAY_TARGET,
@@ -1372,6 +1436,9 @@ app.use(requireDashboardAuth, async (req, res) => {
   }
 
   if (isConfigured()) {
+    if (!isWithinServiceWindow()) {
+      return res.status(503).type("text/plain").send(`Service outside configured window ${SERVICE_START_TIME}-${SERVICE_STOP_TIME} ${SERVICE_TIME_ZONE}\n`);
+    }
     try {
       await ensureGatewayRunning();
     } catch (err) {
@@ -1431,24 +1498,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     }
   }
 
-  // Sync gateway tokens in config with the current env var on every startup.
-  // This prevents "gateway token mismatch" when OPENCLAW_GATEWAY_TOKEN changes
-  // (e.g. Railway variable update) but the config file still has the old value.
-  if (isConfigured() && OPENCLAW_GATEWAY_TOKEN) {
-    console.log("[wrapper] syncing gateway tokens in config...");
-    try {
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
-      console.log("[wrapper] gateway tokens synced");
-    } catch (err) {
-      console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
-    }
-  }
-
-  // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
-  // work even if nobody visits the web UI.
-  if (isConfigured()) {
+  if (isConfigured() && AUTO_START_GATEWAY && isWithinServiceWindow()) {
     console.log("[wrapper] config detected; starting gateway...");
     try {
       await ensureGatewayRunning();
@@ -1465,6 +1515,10 @@ server.on("upgrade", async (req, socket, head) => {
   // The gateway authenticates at the protocol layer and we inject the gateway token below.
 
   if (!isConfigured()) {
+    socket.destroy();
+    return;
+  }
+  if (!isWithinServiceWindow()) {
     socket.destroy();
     return;
   }
