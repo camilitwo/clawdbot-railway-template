@@ -1,12 +1,15 @@
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 
 import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
+
+const require = createRequire(import.meta.url);
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
@@ -84,6 +87,7 @@ const SERVICE_STOP_TIME = process.env.CLAWDBOT_STOP_TIME?.trim() || "00:00";
 const AUTO_START_GATEWAY = process.env.CLAWDBOT_AUTOSTART_GATEWAY === "true";
 const PRIMARY_MODEL = process.env.CLAWDBOT_PRIMARY_MODEL?.trim() || "github-copilot/claude-opus-4.7";
 const GATEWAY_MIGRATION_RETRY_MS = Number.parseInt(process.env.CLAWDBOT_GATEWAY_MIGRATION_RETRY_MS ?? "210000", 10);
+const CLEAR_GATEWAY_OWNER_LEASE_ON_START = process.env.CLAWDBOT_CLEAR_GATEWAY_OWNER_LEASE_ON_START === "true";
 
 function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
@@ -221,6 +225,26 @@ function updateConfigFileBestEffort(updates) {
   fs.writeFileSync(p, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
+function clearGatewayOwnerLeaseBestEffort() {
+  if (!CLEAR_GATEWAY_OWNER_LEASE_ON_START) return;
+  const dbPath = path.join(STATE_DIR, "state", "openclaw.sqlite");
+  if (!fs.existsSync(dbPath)) return;
+  try {
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    try {
+      const result = db
+        .prepare("DELETE FROM state_leases WHERE scope = ? AND lease_key = ?")
+        .run("gateway-owner", "global");
+      if (result.changes > 0) console.warn("[wrapper] cleared stale gateway owner lease");
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    console.warn(`[wrapper] could not clear gateway owner lease: ${String(err)}`);
+  }
+}
+
 async function syncGatewayConfigBestEffort() {
   if (gatewayConfigSynced || !isConfigured() || !OPENCLAW_GATEWAY_TOKEN) return;
   gatewayConfigSynced = true;
@@ -307,6 +331,7 @@ async function startGateway() {
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
   await syncGatewayConfigBestEffort();
   await applyRuntimeConfigBestEffort();
+  clearGatewayOwnerLeaseBestEffort();
 
   const args = [
     "gateway",
