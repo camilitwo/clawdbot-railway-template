@@ -83,6 +83,7 @@ const SERVICE_START_TIME = process.env.CLAWDBOT_START_TIME?.trim() || "06:30";
 const SERVICE_STOP_TIME = process.env.CLAWDBOT_STOP_TIME?.trim() || "00:00";
 const AUTO_START_GATEWAY = process.env.CLAWDBOT_AUTOSTART_GATEWAY === "true";
 const PRIMARY_MODEL = process.env.CLAWDBOT_PRIMARY_MODEL?.trim() || "github-copilot/claude-opus-4.7";
+const GATEWAY_MIGRATION_RETRY_MS = Number.parseInt(process.env.CLAWDBOT_GATEWAY_MIGRATION_RETRY_MS ?? "210000", 10);
 
 function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
@@ -149,6 +150,7 @@ let lastDoctorOutput = null;
 let lastDoctorAt = null;
 let gatewayConfigSynced = false;
 let runtimeConfigApplied = false;
+let gatewayRetryTimer = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -305,6 +307,17 @@ async function startGateway() {
     console.error(msg);
     lastGatewayExit = { code, signal, at: new Date().toISOString() };
     gatewayProc = null;
+    if (code === 78 && isWithinServiceWindow() && !gatewayRetryTimer) {
+      console.warn(`[gateway] retrying after migration lock in ${GATEWAY_MIGRATION_RETRY_MS}ms`);
+      gatewayRetryTimer = setTimeout(() => {
+        gatewayRetryTimer = null;
+        ensureGatewayRunning().catch((err) => {
+          lastGatewayError = `[gateway] retry failed: ${String(err)}`;
+          console.error(lastGatewayError);
+        });
+      }, GATEWAY_MIGRATION_RETRY_MS);
+      gatewayRetryTimer.unref?.();
+    }
   });
 }
 
@@ -351,6 +364,10 @@ async function ensureGatewayRunning() {
 }
 
 async function restartGateway() {
+  if (gatewayRetryTimer) {
+    clearTimeout(gatewayRetryTimer);
+    gatewayRetryTimer = null;
+  }
   if (gatewayProc) {
     try {
       gatewayProc.kill("SIGTERM");
