@@ -196,11 +196,12 @@ function serviceWindowStatus(date = new Date()) {
 async function syncGatewayConfigBestEffort() {
   if (gatewayConfigSynced || !isConfigured() || !OPENCLAW_GATEWAY_TOKEN) return;
   gatewayConfigSynced = true;
+  const quickConfig = { timeoutMs: 15_000 };
   console.log("[wrapper] syncing gateway tokens in config...");
   try {
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]), quickConfig);
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]), quickConfig);
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]), quickConfig);
     console.log("[wrapper] gateway tokens synced");
   } catch (err) {
     gatewayConfigSynced = false;
