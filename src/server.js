@@ -82,6 +82,7 @@ const SERVICE_TIME_ZONE = process.env.CLAWDBOT_TIME_ZONE?.trim() || "America/San
 const SERVICE_START_TIME = process.env.CLAWDBOT_START_TIME?.trim() || "06:30";
 const SERVICE_STOP_TIME = process.env.CLAWDBOT_STOP_TIME?.trim() || "00:00";
 const AUTO_START_GATEWAY = process.env.CLAWDBOT_AUTOSTART_GATEWAY === "true";
+const PRIMARY_MODEL = process.env.CLAWDBOT_PRIMARY_MODEL?.trim() || "github-copilot/claude-opus-4.7";
 
 function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
@@ -147,6 +148,7 @@ let lastGatewayExit = null;
 let lastDoctorOutput = null;
 let lastDoctorAt = null;
 let gatewayConfigSynced = false;
+let runtimeConfigApplied = false;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -206,6 +208,32 @@ async function syncGatewayConfigBestEffort() {
   }
 }
 
+async function applyRuntimeConfigBestEffort() {
+  if (runtimeConfigApplied || !isConfigured()) return;
+  runtimeConfigApplied = true;
+
+  try {
+    if (PRIMARY_MODEL) {
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agents.defaults.model.primary", PRIMARY_MODEL]));
+      await runCmd(OPENCLAW_NODE, clawArgs(["models", "set", PRIMARY_MODEL]));
+      console.log(`[wrapper] primary model configured: ${PRIMARY_MODEL}`);
+    }
+
+    const telegramToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+    if (telegramToken) {
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.enabled", "true"]));
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.botToken", telegramToken]));
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "channels.telegram.dmPolicy", "pairing"]));
+      console.log("[wrapper] telegram channel configured from TELEGRAM_BOT_TOKEN");
+    } else {
+      console.warn("[wrapper] TELEGRAM_BOT_TOKEN is not set; telegram channel was not configured");
+    }
+  } catch (err) {
+    runtimeConfigApplied = false;
+    console.warn(`[wrapper] runtime config failed: ${String(err)}`);
+  }
+}
+
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   const start = Date.now();
@@ -240,6 +268,7 @@ async function startGateway() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
   await syncGatewayConfigBestEffort();
+  await applyRuntimeConfigBestEffort();
 
   const args = [
     "gateway",
