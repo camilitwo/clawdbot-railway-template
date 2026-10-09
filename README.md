@@ -57,6 +57,25 @@ If you’re filing a bug, please include the output of:
 - `/healthz`
 - `/setup/api/debug` (after authenticating to /setup)
 
+`/setup/healthz` is the Railway liveness check and remains `200` while the
+wrapper is running. `/healthz` is the Gateway readiness check: it returns
+`503` when the Gateway is unreachable during the service window, and `200`
+when it is reachable or intentionally outside that window.
+
+The wrapper is the only Gateway supervisor. Starts, stops, restarts and crash
+recovery are serialized, readiness is confirmed over the internal TCP port,
+and SIGTERM/SIGINT wait for the child process to close before the HTTP server
+exits. Recovery uses bounded backoff (2s, 5s, 10s, 20s, 30s, then 60s with
+jitter). A graceful stop defaults to 30 seconds and then uses SIGKILL; set
+`CLAWDBOT_GATEWAY_SHUTDOWN_TIMEOUT_MS` only when that value fits the Railway
+deployment's termination grace period.
+
+Do not enable `CLAWDBOT_CLEAR_GATEWAY_OWNER_LEASE_ON_START` as a generic fix.
+If explicitly enabled, the wrapper deletes only an already-expired lease and
+uses an owner- and expiry-qualified SQL delete. Active leases are left alone
+and the Gateway retries later. No lock files, sessions, credentials, or
+persistent state are removed by lifecycle recovery.
+
 ## Getting chat tokens (so you don’t have to scramble)
 
 ### Telegram bot token
@@ -140,7 +159,20 @@ Checklist:
   - `OPENCLAW_STATE_DIR=/data/.openclaw`
   - `OPENCLAW_WORKSPACE_DIR=/data/workspace`
 - Ensure **Public Networking** is enabled (Railway will inject `PORT`).
-- Check Railway logs for the wrapper error: it will show `Gateway not ready:` with the reason.
+- Keep Railway's healthcheck on `/setup/healthz` so an intentional Gateway stop
+  or an out-of-window period does not trigger a deployment replacement.
+- Check Railway logs for lifecycle lines such as `readiness confirmed`,
+  `retry scheduled`, or `stopping gracefully`.
+
+During a redeploy, Railway may deliver SIGTERM to the old container before the
+replacement starts, but deployment overlap and volume attachment timing are
+platform concerns. The wrapper never assumes a PID or hostname proves that a
+lease is stale; it waits for expiry unless OpenClaw has already released it.
+Validate a redeploy by checking one `process spawned` PID, a subsequent
+`readiness confirmed`, no repeated `retry scheduled` loop, and a successful
+`/healthz` response. Roll back by redeploying the previous image with the same
+`/data` volume and variables; do not delete `state_leases` or the state
+directory manually.
 
 ### Legacy CLAWDBOT_* env vars / multiple state directories
 

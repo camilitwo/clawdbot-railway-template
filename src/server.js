@@ -86,8 +86,20 @@ const SERVICE_START_TIME = process.env.CLAWDBOT_START_TIME?.trim() || "06:30";
 const SERVICE_STOP_TIME = process.env.CLAWDBOT_STOP_TIME?.trim() || "00:00";
 const AUTO_START_GATEWAY = process.env.CLAWDBOT_AUTOSTART_GATEWAY === "true";
 const PRIMARY_MODEL = process.env.CLAWDBOT_PRIMARY_MODEL?.trim() || "github-copilot/claude-opus-4.7";
-const GATEWAY_MIGRATION_RETRY_MS = Number.parseInt(process.env.CLAWDBOT_GATEWAY_MIGRATION_RETRY_MS ?? "210000", 10);
 const CLEAR_GATEWAY_OWNER_LEASE_ON_START = process.env.CLAWDBOT_CLEAR_GATEWAY_OWNER_LEASE_ON_START === "true";
+const GATEWAY_SHUTDOWN_TIMEOUT_MS = Number.parseInt(process.env.CLAWDBOT_GATEWAY_SHUTDOWN_TIMEOUT_MS ?? "30000", 10);
+const GATEWAY_RETRY_DELAYS_MS = [2000, 5000, 10000, 20000, 30000, 60000];
+
+const GATEWAY_STATES = Object.freeze({
+  STOPPED: "STOPPED",
+  STARTING: "STARTING",
+  RUNNING: "RUNNING",
+  STOPPING: "STOPPING",
+  RESTARTING: "RESTARTING",
+  WAITING_FOR_LEASE: "WAITING_FOR_LEASE",
+  FAILED: "FAILED",
+  SHUTTING_DOWN: "SHUTTING_DOWN",
+});
 
 function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
@@ -146,6 +158,13 @@ function isConfigured() {
 
 let gatewayProc = null;
 let gatewayStarting = null;
+let gatewayState = GATEWAY_STATES.STOPPED;
+let gatewayDesiredRunning = false;
+let gatewayLifecycleQueue = Promise.resolve();
+let gatewayStopPromise = null;
+let gatewayRetryAttempt = 0;
+let shuttingDown = false;
+let shutdownPromise = null;
 
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
@@ -158,6 +177,12 @@ let gatewayRetryTimer = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function runGatewayLifecycle(operation) {
+  const next = gatewayLifecycleQueue.then(operation, operation);
+  gatewayLifecycleQueue = next.catch(() => {});
+  return next;
 }
 
 function parseClockMinutes(value, fallback) {
@@ -233,10 +258,19 @@ function clearGatewayOwnerLeaseBestEffort() {
     const { DatabaseSync } = require("node:sqlite");
     const db = new DatabaseSync(dbPath);
     try {
+      const lease = db
+        .prepare("SELECT owner, expires_at FROM state_leases WHERE scope = ? AND lease_key = ?")
+        .get("gateway-owner", "global");
+      if (!lease) return;
+      const now = Date.now();
+      if (Number(lease.expires_at) > now) {
+        console.warn("[wrapper][gateway] ownership lease is still active; waiting for expiry");
+        return;
+      }
       const result = db
-        .prepare("DELETE FROM state_leases WHERE scope = ? AND lease_key = ?")
-        .run("gateway-owner", "global");
-      if (result.changes > 0) console.warn("[wrapper] cleared stale gateway owner lease");
+        .prepare("DELETE FROM state_leases WHERE scope = ? AND lease_key = ? AND owner = ? AND expires_at <= ?")
+        .run("gateway-owner", "global", lease.owner, now);
+      if (result.changes > 0) console.warn("[wrapper][gateway] cleared expired ownership lease");
     } finally {
       db.close();
     }
@@ -321,7 +355,8 @@ async function waitForGatewayReady(opts = {}) {
 }
 
 async function startGateway() {
-  if (gatewayProc) return;
+  if (shuttingDown) throw new Error("Gateway start cancelled during shutdown");
+  if (gatewayProc) return gatewayProc;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
   if (!isWithinServiceWindow()) {
     throw new Error(`Gateway disabled outside service window ${SERVICE_START_TIME}-${SERVICE_STOP_TIME} ${SERVICE_TIME_ZONE}`);
@@ -347,7 +382,7 @@ async function startGateway() {
     "--force",
   ];
 
-  gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
+  const proc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
     env: {
       ...process.env,
@@ -356,30 +391,61 @@ async function startGateway() {
     },
   });
 
-  gatewayProc.on("error", (err) => {
+  let exited = false;
+  let exitInfo = null;
+  let resolveClosed;
+  const closed = new Promise((resolve) => { resolveClosed = resolve; });
+
+  proc.on("error", (err) => {
     const msg = `[gateway] spawn error: ${String(err)}`;
     console.error(msg);
     lastGatewayError = msg;
-    gatewayProc = null;
+    exited = true;
+    exitInfo = { code: null, signal: null };
+    resolveClosed(exitInfo);
   });
 
-  gatewayProc.on("exit", (code, signal) => {
+  proc.on("exit", (code, signal) => {
     const msg = `[gateway] exited code=${code} signal=${signal}`;
     console.error(msg);
     lastGatewayExit = { code, signal, at: new Date().toISOString() };
+    exited = true;
+    exitInfo = { code, signal };
+  });
+
+  proc.on("close", (code, signal) => {
+    if (!exited) exitInfo = { code, signal };
+    resolveClosed(exitInfo || { code, signal });
+    if (gatewayProc !== proc) return;
     gatewayProc = null;
-    if (code === 78 && isWithinServiceWindow() && !gatewayRetryTimer) {
-      console.warn(`[gateway] retrying after migration lock in ${GATEWAY_MIGRATION_RETRY_MS}ms`);
-      gatewayRetryTimer = setTimeout(() => {
-        gatewayRetryTimer = null;
-        ensureGatewayRunning().catch((err) => {
-          lastGatewayError = `[gateway] retry failed: ${String(err)}`;
-          console.error(lastGatewayError);
-        });
-      }, GATEWAY_MIGRATION_RETRY_MS);
-      gatewayRetryTimer.unref?.();
+    gatewayState = shuttingDown ? GATEWAY_STATES.SHUTTING_DOWN : GATEWAY_STATES.STOPPED;
+    if (gatewayDesiredRunning && !shuttingDown && isWithinServiceWindow()) {
+      scheduleGatewayRetry(exitInfo?.code, exitInfo?.signal);
     }
   });
+
+  gatewayProc = proc;
+  gatewayState = GATEWAY_STATES.STARTING;
+  console.log(`[wrapper][gateway] process spawned pid=${proc.pid}`);
+  proc.closed = closed;
+  return proc;
+}
+
+function scheduleGatewayRetry(code, signal) {
+  if (gatewayRetryTimer || shuttingDown || !gatewayDesiredRunning || !isWithinServiceWindow()) return;
+  gatewayRetryAttempt += 1;
+  const base = GATEWAY_RETRY_DELAYS_MS[Math.min(gatewayRetryAttempt - 1, GATEWAY_RETRY_DELAYS_MS.length - 1)];
+  const delay = Math.round(base * (0.8 + Math.random() * 0.4));
+  gatewayState = code === 78 ? GATEWAY_STATES.WAITING_FOR_LEASE : GATEWAY_STATES.FAILED;
+  console.warn(`[wrapper][gateway] retry scheduled delay=${delay}ms attempt=${gatewayRetryAttempt} code=${code} signal=${signal}`);
+  gatewayRetryTimer = setTimeout(() => {
+    gatewayRetryTimer = null;
+    ensureGatewayRunning().catch((err) => {
+      lastGatewayError = `[gateway] retry failed: ${String(err)}`;
+      console.error(lastGatewayError);
+    });
+  }, delay);
+  gatewayRetryTimer.unref?.();
 }
 
 async function runDoctorBestEffort() {
@@ -397,49 +463,89 @@ async function runDoctorBestEffort() {
   }
 }
 
-async function ensureGatewayRunning() {
+async function ensureGatewayRunningInternal() {
   if (!isConfigured()) return { ok: false, reason: "not configured" };
-  if (gatewayProc) return { ok: true };
-  if (!gatewayStarting) {
-    gatewayStarting = (async () => {
-      try {
-        lastGatewayError = null;
-        await startGateway();
-        const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
-        if (!ready) {
-          throw new Error("Gateway did not become ready in time");
-        }
-      } catch (err) {
-        const msg = `[gateway] start failure: ${String(err)}`;
-        lastGatewayError = msg;
-        // Collect extra diagnostics to help users file issues.
-        await runDoctorBestEffort();
-        throw err;
-      }
-    })().finally(() => {
+  if (shuttingDown) return { ok: false, reason: "shutting down" };
+  gatewayDesiredRunning = true;
+  if (gatewayProc && gatewayState === GATEWAY_STATES.RUNNING) return { ok: true };
+  if (gatewayProc) await stopGatewayGracefullyInternal({ administrative: false });
+  gatewayStarting = (async () => {
+    try {
+      lastGatewayError = null;
+      const proc = await startGateway();
+      const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
+      if (!ready || proc !== gatewayProc) throw new Error("Gateway did not become ready in time");
+      gatewayState = GATEWAY_STATES.RUNNING;
+      gatewayRetryAttempt = 0;
+      console.log("[wrapper][gateway] readiness confirmed");
+      return { ok: true };
+    } catch (err) {
+      const msg = `[gateway] start failure: ${String(err)}`;
+      lastGatewayError = msg;
+      await runDoctorBestEffort();
+      if (gatewayProc) await stopGatewayGracefullyInternal({ administrative: false });
+      scheduleGatewayRetry(null, null);
+      throw err;
+    } finally {
       gatewayStarting = null;
-    });
-  }
-  await gatewayStarting;
-  return { ok: true };
+    }
+  })();
+  return gatewayStarting;
 }
 
-async function restartGateway() {
+async function ensureGatewayRunning() {
+  return runGatewayLifecycle(() => ensureGatewayRunningInternal());
+}
+
+async function stopGatewayGracefullyInternal({ administrative = true } = {}) {
+  if (administrative) gatewayDesiredRunning = false;
   if (gatewayRetryTimer) {
     clearTimeout(gatewayRetryTimer);
     gatewayRetryTimer = null;
   }
-  if (gatewayProc) {
+  if (gatewayStopPromise) return gatewayStopPromise;
+  const proc = gatewayProc;
+  if (!proc) {
+    gatewayState = shuttingDown ? GATEWAY_STATES.SHUTTING_DOWN : GATEWAY_STATES.STOPPED;
+    return;
+  }
+  gatewayState = shuttingDown ? GATEWAY_STATES.SHUTTING_DOWN : GATEWAY_STATES.STOPPING;
+  console.log(`[wrapper][gateway] stopping gracefully pid=${proc.pid}`);
+  gatewayStopPromise = (async () => {
     try {
-      gatewayProc.kill("SIGTERM");
+      proc.kill("SIGTERM");
     } catch {
       // ignore
     }
-    // Give it a moment to exit and release the port.
-    await sleep(750);
-    gatewayProc = null;
-  }
-  return ensureGatewayRunning();
+    const result = await Promise.race([
+      proc.closed,
+      sleep(GATEWAY_SHUTDOWN_TIMEOUT_MS).then(() => ({ timeout: true })),
+    ]);
+    if (result?.timeout) {
+      console.error(`[wrapper][gateway] graceful shutdown exceeded ${GATEWAY_SHUTDOWN_TIMEOUT_MS}ms; sending SIGKILL`);
+      try { proc.kill("SIGKILL"); } catch {}
+      await proc.closed;
+    }
+    console.log(`[wrapper][gateway] process stopped code=${result?.code ?? "unknown"}`);
+  })().finally(() => {
+    gatewayStopPromise = null;
+    if (gatewayProc === proc) gatewayProc = null;
+  });
+  return gatewayStopPromise;
+}
+
+async function stopGatewayGracefully(options = {}) {
+  return runGatewayLifecycle(() => stopGatewayGracefullyInternal(options));
+}
+
+async function restartGateway() {
+  return runGatewayLifecycle(async () => {
+    if (shuttingDown) return { ok: false, reason: "shutting down" };
+    gatewayDesiredRunning = true;
+    gatewayState = GATEWAY_STATES.RESTARTING;
+    await stopGatewayGracefullyInternal({ administrative: false });
+    return ensureGatewayRunningInternal();
+  });
 }
 
 function requireSetupAuth(req, res, next) {
@@ -508,8 +614,11 @@ app.get("/healthz", async (_req, res) => {
     }
   }
 
-  res.json({
-    ok: true,
+  const inServiceWindow = isWithinServiceWindow();
+  const ready = !isConfigured() || !inServiceWindow || gatewayReachable;
+  res.status(ready ? 200 : 503).json({
+    ok: ready,
+    ready,
     wrapper: {
       configured: isConfigured(),
       stateDir: STATE_DIR,
@@ -519,6 +628,7 @@ app.get("/healthz", async (_req, res) => {
     gateway: {
       target: GATEWAY_TARGET,
       reachable: gatewayReachable,
+      state: gatewayState,
       lastError: lastGatewayError,
       lastExit: lastGatewayExit,
       lastDoctorAt,
@@ -1083,6 +1193,9 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       internalGatewayPort: INTERNAL_GATEWAY_PORT,
       gatewayTarget: GATEWAY_TARGET,
       gatewayRunning: Boolean(gatewayProc),
+      gatewayState,
+      gatewayRetryAttempt,
+      shuttingDown,
       gatewayTokenFromEnv: Boolean(process.env.OPENCLAW_GATEWAY_TOKEN?.trim()),
       gatewayTokenPersisted: fs.existsSync(path.join(STATE_DIR, "gateway.token")),
       lastGatewayError,
@@ -1176,11 +1289,7 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       return res.json({ ok: true, output: "Gateway restarted (wrapper-managed).\n" });
     }
     if (cmd === "gateway.stop") {
-      if (gatewayProc) {
-        try { gatewayProc.kill("SIGTERM"); } catch {}
-        await sleep(750);
-        gatewayProc = null;
-      }
+      await stopGatewayGracefully();
       return res.json({ ok: true, output: "Gateway stopped (wrapper-managed).\n" });
     }
     if (cmd === "gateway.start") {
@@ -1321,15 +1430,7 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   // Keep credentials/sessions/workspace by default.
   try {
     // Stop gateway to avoid running gateway + onboard concurrently on small Railway instances.
-    try {
-      if (gatewayProc) {
-        try { gatewayProc.kill("SIGTERM"); } catch {}
-        await sleep(750);
-        gatewayProc = null;
-      }
-    } catch {
-      // ignore
-    }
+    await stopGatewayGracefully();
 
     const candidates = typeof resolveConfigCandidates === "function" ? resolveConfigCandidates() : [configPath()];
     for (const p of candidates) {
@@ -1440,11 +1541,7 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
     }
 
     // Stop gateway before restore so we don't overwrite live files.
-    if (gatewayProc) {
-      try { gatewayProc.kill("SIGTERM"); } catch {}
-      await sleep(750);
-      gatewayProc = null;
-    }
+    await stopGatewayGracefully();
 
     const buf = await readBodyBuffer(req, 250 * 1024 * 1024); // 250MB max
     if (!buf.length) return res.status(400).type("text/plain").send("Empty body\n");
@@ -1640,20 +1737,27 @@ server.on("upgrade", async (req, socket, head) => {
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
-process.on("SIGTERM", () => {
-  // Best-effort shutdown
-  try {
-    if (gatewayProc) gatewayProc.kill("SIGTERM");
-  } catch {
-    // ignore
-  }
-
-  // Stop accepting new connections; allow in-flight requests to complete briefly.
-  try {
-    server.close(() => process.exit(0));
-  } catch {
+async function shutdown() {
+  if (shutdownPromise) return shutdownPromise;
+  shuttingDown = true;
+  gatewayDesiredRunning = false;
+  gatewayState = GATEWAY_STATES.SHUTTING_DOWN;
+  console.log("[wrapper][gateway] shutdown requested");
+  shutdownPromise = (async () => {
+    const forceTimer = setTimeout(() => {
+      console.error("[wrapper] shutdown grace period exceeded; forcing exit");
+      process.exit(1);
+    }, GATEWAY_SHUTDOWN_TIMEOUT_MS + 5000);
+    await stopGatewayGracefully({ administrative: true });
+    await new Promise((resolve) => {
+      try { server.close(resolve); } catch { resolve(); }
+    });
+    clearTimeout(forceTimer);
+    console.log("[wrapper][gateway] shutdown completed");
     process.exit(0);
-  }
+  })();
+  return shutdownPromise;
+}
 
-  setTimeout(() => process.exit(0), 5_000).unref?.();
-});
+process.on("SIGTERM", () => { void shutdown(); });
+process.on("SIGINT", () => { void shutdown(); });
