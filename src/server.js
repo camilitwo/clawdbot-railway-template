@@ -1,15 +1,12 @@
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 
 import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
-
-const require = createRequire(import.meta.url);
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
@@ -86,7 +83,6 @@ const SERVICE_START_TIME = process.env.CLAWDBOT_START_TIME?.trim() || "06:30";
 const SERVICE_STOP_TIME = process.env.CLAWDBOT_STOP_TIME?.trim() || "00:00";
 const AUTO_START_GATEWAY = process.env.CLAWDBOT_AUTOSTART_GATEWAY === "true";
 const PRIMARY_MODEL = process.env.CLAWDBOT_PRIMARY_MODEL?.trim() || "github-copilot/claude-opus-4.7";
-const CLEAR_GATEWAY_OWNER_LEASE_ON_START = process.env.CLAWDBOT_CLEAR_GATEWAY_OWNER_LEASE_ON_START === "true";
 const GATEWAY_SHUTDOWN_TIMEOUT_MS = Number.parseInt(process.env.CLAWDBOT_GATEWAY_SHUTDOWN_TIMEOUT_MS ?? "30000", 10);
 const GATEWAY_RETRY_DELAYS_MS = [2000, 5000, 10000, 20000, 30000, 60000];
 
@@ -165,6 +161,7 @@ let gatewayStopPromise = null;
 let gatewayRetryAttempt = 0;
 let shuttingDown = false;
 let shutdownPromise = null;
+let gatewayReadinessController = null;
 
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
@@ -250,35 +247,6 @@ function updateConfigFileBestEffort(updates) {
   fs.writeFileSync(p, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
-function clearGatewayOwnerLeaseBestEffort() {
-  if (!CLEAR_GATEWAY_OWNER_LEASE_ON_START) return;
-  const dbPath = path.join(STATE_DIR, "state", "openclaw.sqlite");
-  if (!fs.existsSync(dbPath)) return;
-  try {
-    const { DatabaseSync } = require("node:sqlite");
-    const db = new DatabaseSync(dbPath);
-    try {
-      const lease = db
-        .prepare("SELECT owner, expires_at FROM state_leases WHERE scope = ? AND lease_key = ?")
-        .get("gateway-owner", "global");
-      if (!lease) return;
-      const now = Date.now();
-      if (Number(lease.expires_at) > now) {
-        console.warn("[wrapper][gateway] ownership lease is still active; waiting for expiry");
-        return;
-      }
-      const result = db
-        .prepare("DELETE FROM state_leases WHERE scope = ? AND lease_key = ? AND owner = ? AND expires_at <= ?")
-        .run("gateway-owner", "global", lease.owner, now);
-      if (result.changes > 0) console.warn("[wrapper][gateway] cleared expired ownership lease");
-    } finally {
-      db.close();
-    }
-  } catch (err) {
-    console.warn(`[wrapper] could not clear gateway owner lease: ${String(err)}`);
-  }
-}
-
 async function syncGatewayConfigBestEffort() {
   if (gatewayConfigSynced || !isConfigured() || !OPENCLAW_GATEWAY_TOKEN) return;
   gatewayConfigSynced = true;
@@ -332,26 +300,59 @@ async function applyRuntimeConfigBestEffort() {
 
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      // Try the default Control UI base path, then fall back to root.
-      const paths = ["/openclaw", "/"];
-      for (const p of paths) {
-        try {
-          const res = await fetch(`${GATEWAY_TARGET}${p}`, { method: "GET" });
-          // Any HTTP response means the port is open.
-          if (res) return true;
-        } catch {
-          // try next
-        }
+  const proc = opts.proc;
+  const signal = opts.signal;
+  let timeoutId;
+  let retryTimer;
+  let activeFetchController;
+  let settled = false;
+  let resolveReady;
+
+  const ready = new Promise((resolve) => { resolveReady = resolve; });
+  const finish = (value) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeoutId);
+    clearTimeout(retryTimer);
+    activeFetchController?.abort();
+    signal?.removeEventListener("abort", onAbort);
+    proc?.removeListener("error", onProcessEnded);
+    proc?.removeListener("exit", onProcessEnded);
+    proc?.removeListener("close", onProcessEnded);
+    resolveReady(value);
+  };
+  const onAbort = () => finish(false);
+  const onProcessEnded = () => finish(false);
+
+  signal?.addEventListener("abort", onAbort, { once: true });
+  proc?.once("error", onProcessEnded);
+  proc?.once("exit", onProcessEnded);
+  proc?.once("close", onProcessEnded);
+  timeoutId = setTimeout(() => finish(false), timeoutMs);
+
+  const probe = async () => {
+    // Try the Control UI path first, then root. A response means the port is ready.
+    for (const p of ["/openclaw", "/"]) {
+      if (settled) return;
+      activeFetchController = new AbortController();
+      try {
+        const res = await fetch(`${GATEWAY_TARGET}${p}`, {
+          method: "GET",
+          signal: activeFetchController.signal,
+        });
+        if (res) return finish(true);
+      } catch {
+        // The gateway may still be binding; retry until process exit or timeout.
+      } finally {
+        activeFetchController = null;
       }
-    } catch {
-      // not ready
     }
-    await sleep(250);
-  }
-  return false;
+    if (!settled) retryTimer = setTimeout(() => { retryTimer = null; void probe(); }, 250);
+  };
+
+  if (proc?.exitCode != null || proc?.signalCode != null) finish(false);
+  else void probe();
+  return ready;
 }
 
 async function startGateway() {
@@ -366,7 +367,6 @@ async function startGateway() {
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
   await syncGatewayConfigBestEffort();
   await applyRuntimeConfigBestEffort();
-  clearGatewayOwnerLeaseBestEffort();
 
   const args = [
     "gateway",
@@ -473,7 +473,12 @@ async function ensureGatewayRunningInternal() {
     try {
       lastGatewayError = null;
       const proc = await startGateway();
-      const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
+      gatewayReadinessController = new AbortController();
+      const ready = await waitForGatewayReady({
+        timeoutMs: 20_000,
+        proc,
+        signal: gatewayReadinessController.signal,
+      });
       if (!ready || proc !== gatewayProc) throw new Error("Gateway did not become ready in time");
       gatewayState = GATEWAY_STATES.RUNNING;
       gatewayRetryAttempt = 0;
@@ -484,9 +489,9 @@ async function ensureGatewayRunningInternal() {
       lastGatewayError = msg;
       await runDoctorBestEffort();
       if (gatewayProc) await stopGatewayGracefullyInternal({ administrative: false });
-      scheduleGatewayRetry(null, null);
       throw err;
     } finally {
+      gatewayReadinessController = null;
       gatewayStarting = null;
     }
   })();
@@ -1742,6 +1747,7 @@ async function shutdown() {
   shuttingDown = true;
   gatewayDesiredRunning = false;
   gatewayState = GATEWAY_STATES.SHUTTING_DOWN;
+  gatewayReadinessController?.abort();
   console.log("[wrapper][gateway] shutdown requested");
   shutdownPromise = (async () => {
     const forceTimer = setTimeout(() => {

@@ -70,11 +70,20 @@ jitter). A graceful stop defaults to 30 seconds and then uses SIGKILL; set
 `CLAWDBOT_GATEWAY_SHUTDOWN_TIMEOUT_MS` only when that value fits the Railway
 deployment's termination grace period.
 
-Do not enable `CLAWDBOT_CLEAR_GATEWAY_OWNER_LEASE_ON_START` as a generic fix.
-If explicitly enabled, the wrapper deletes only an already-expired lease and
-uses an owner- and expiry-qualified SQL delete. Active leases are left alone
-and the Gateway retries later. No lock files, sessions, credentials, or
-persistent state are removed by lifecycle recovery.
+The wrapper does not read or write `state_leases` and does not expose a lease
+cleanup switch. OpenClaw remains the only owner of lease acquisition,
+heartbeat, expiry and release. If a residual lease blocks startup, the wrapper
+waits and retries; it never assumes that a different PID or hostname means
+that the owner is dead. No lock files, sessions, credentials, or persistent
+state are removed by lifecycle recovery.
+
+The OpenClaw 2026.9.6 bundle was inspected during validation. Its native
+acquisition transaction removes only leases with `expires_at <= now` and then
+inserts the new owner atomically. Heartbeats update only the matching `owner`
+while the lease is still valid; release also requires that owner. Native
+reclaim is restricted to a same-host process whose PID and start identity are
+provably dead; a different hostname is treated as `unknown`. The wrapper
+therefore intentionally delegates all of these operations to OpenClaw.
 
 ## Getting chat tokens (so you don’t have to scramble)
 
