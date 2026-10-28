@@ -15,3 +15,13 @@ test("service window uses America/Santiago timezone by default", () => {
   assert.match(src, /SERVICE_START_TIME/);
   assert.match(src, /SERVICE_STOP_TIME/);
 });
+
+test("service window scheduler stops and restarts the gateway at configured boundaries", () => {
+  assert.match(src, /async function reconcileServiceWindow\(\)/);
+  assert.match(src, /service window closed; stopping gateway/);
+  assert.match(src, /await stopGatewayGracefully\(\{ administrative: true \}\)/);
+  assert.match(src, /service window open; starting gateway/);
+  assert.match(src, /await ensureGatewayRunning\(\)/);
+  assert.match(src, /startServiceWindowScheduler\(\)/);
+  assert.match(src, /clearInterval\(serviceWindowTimer\)/);
+});

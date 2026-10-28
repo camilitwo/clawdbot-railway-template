@@ -171,6 +171,7 @@ let lastDoctorAt = null;
 let gatewayConfigSynced = false;
 let runtimeConfigApplied = false;
 let gatewayRetryTimer = null;
+let serviceWindowTimer = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -551,6 +552,34 @@ async function restartGateway() {
     await stopGatewayGracefullyInternal({ administrative: false });
     return ensureGatewayRunningInternal();
   });
+}
+
+async function reconcileServiceWindow() {
+  if (shuttingDown || !isConfigured()) return;
+
+  if (!isWithinServiceWindow()) {
+    if (gatewayProc || gatewayStarting || gatewayDesiredRunning) {
+      console.log(`[wrapper][schedule] service window closed; stopping gateway until ${SERVICE_START_TIME} ${SERVICE_TIME_ZONE}`);
+      gatewayReadinessController?.abort();
+      await stopGatewayGracefully({ administrative: true });
+    }
+    return;
+  }
+
+  if (AUTO_START_GATEWAY && !gatewayProc && !gatewayStarting) {
+    console.log(`[wrapper][schedule] service window open; starting gateway until ${SERVICE_STOP_TIME} ${SERVICE_TIME_ZONE}`);
+    await ensureGatewayRunning();
+  }
+}
+
+function startServiceWindowScheduler() {
+  if (serviceWindowTimer) return;
+  serviceWindowTimer = setInterval(() => {
+    void reconcileServiceWindow().catch((err) => {
+      console.error(`[wrapper][schedule] reconciliation failed: ${String(err)}`);
+    });
+  }, 30_000);
+  serviceWindowTimer.unref?.();
 }
 
 function requireSetupAuth(req, res, next) {
@@ -1717,6 +1746,8 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
     }
   }
+
+  startServiceWindowScheduler();
 });
 
 server.on("upgrade", async (req, socket, head) => {
@@ -1748,6 +1779,10 @@ async function shutdown() {
   gatewayDesiredRunning = false;
   gatewayState = GATEWAY_STATES.SHUTTING_DOWN;
   gatewayReadinessController?.abort();
+  if (serviceWindowTimer) {
+    clearInterval(serviceWindowTimer);
+    serviceWindowTimer = null;
+  }
   console.log("[wrapper][gateway] shutdown requested");
   shutdownPromise = (async () => {
     const forceTimer = setTimeout(() => {
