@@ -15,7 +15,7 @@ RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
 # Install the published OpenClaw package instead of building the whole monorepo.
 # OPENCLAW_GIT_REF is kept for Railway compatibility; tags like v2026.9.6 map to npm version 2026.9.6.
-ARG OPENCLAW_GIT_REF=v2026.9.6
+ARG OPENCLAW_GIT_REF=v2026.9.35
 RUN set -eux; \
   version="${OPENCLAW_GIT_REF#v}"; \
   npm install -g --allow-scripts=@google/genai,koffi,protobufjs,openclaw "openclaw@${version}"; \
