@@ -25,3 +25,10 @@ test("service window scheduler stops and restarts the gateway at configured boun
   assert.match(src, /startServiceWindowScheduler\(\)/);
   assert.match(src, /clearInterval\(serviceWindowTimer\)/);
 });
+
+test("volume audit is opt-in and read-only", () => {
+  assert.match(src, /OPENCLAW_VOLUME_AUDIT/);
+  assert.match(src, /spawnSync\(/);
+  assert.match(src, /\["-x", "-B1", "--max-depth=3", "\/data"\]/);
+  assert.doesNotMatch(src, /volume-audit[^\n]*(rm|unlink|delete)/i);
+});

@@ -177,6 +177,35 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function auditDataVolumeBestEffort() {
+  if (process.env.OPENCLAW_VOLUME_AUDIT !== "true") return;
+  try {
+    const result = childProcess.spawnSync(
+      "du",
+      ["-x", "-B1", "--max-depth=3", "/data"],
+      { encoding: "utf8", timeout: 60_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    if (result.error) throw result.error;
+    if (result.status !== 0) throw new Error(result.stderr?.trim() || `du exited ${result.status}`);
+
+    const rows = result.stdout
+      .trim()
+      .split("\n")
+      .map((line) => {
+        const [rawBytes, ...pathParts] = line.split("\t");
+        return { bytes: Number.parseInt(rawBytes, 10), path: pathParts.join("\t") };
+      })
+      .filter((row) => Number.isFinite(row.bytes) && row.path)
+      .sort((a, b) => b.bytes - a.bytes)
+      .slice(0, 80);
+
+    console.log("[volume-audit] largest directories under /data (bytes):");
+    for (const row of rows) console.log(`[volume-audit] ${row.bytes}\t${row.path}`);
+  } catch (err) {
+    console.warn(`[volume-audit] failed: ${String(err)}`);
+  }
+}
+
 function runGatewayLifecycle(operation) {
   const next = gatewayLifecycleQueue.then(operation, operation);
   gatewayLifecycleQueue = next.catch(() => {});
@@ -1712,6 +1741,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 
   console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
   console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
+  auditDataVolumeBestEffort();
   if (!SETUP_PASSWORD) {
     console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
   }
