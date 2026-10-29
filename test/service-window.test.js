@@ -32,3 +32,9 @@ test("volume audit is opt-in and read-only", () => {
   assert.match(src, /\["-x", "-B1", "--max-depth=3", "\/data"\]/);
   assert.doesNotMatch(src, /volume-audit[^\n]*(rm|unlink|delete)/i);
 });
+
+test("kev cleanup is opt-in and restricted to the exact approved path", () => {
+  assert.match(src, /OPENCLAW_DELETE_KEV_ON_START/);
+  assert.match(src, /target !== "\/data\/kev"/);
+  assert.match(src, /fs\.rmSync\(target, \{ recursive: true, force: true/);
+});

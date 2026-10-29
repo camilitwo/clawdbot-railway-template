@@ -177,6 +177,23 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function deleteKevDirectoryIfRequested() {
+  if (process.env.OPENCLAW_DELETE_KEV_ON_START !== "true") return;
+  const target = path.resolve("/data/kev");
+  if (target !== "/data/kev") throw new Error("Refusing unexpected cleanup target");
+  try {
+    if (!fs.existsSync(target)) {
+      console.log("[volume-cleanup] /data/kev is already absent");
+      return;
+    }
+    fs.rmSync(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 });
+    console.log("[volume-cleanup] permanently deleted /data/kev");
+  } catch (err) {
+    console.error(`[volume-cleanup] failed to delete /data/kev: ${String(err)}`);
+    throw err;
+  }
+}
+
 function auditDataVolumeBestEffort() {
   if (process.env.OPENCLAW_VOLUME_AUDIT !== "true") return;
   try {
@@ -1741,6 +1758,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 
   console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
   console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
+  deleteKevDirectoryIfRequested();
   auditDataVolumeBestEffort();
   if (!SETUP_PASSWORD) {
     console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
